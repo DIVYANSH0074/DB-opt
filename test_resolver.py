@@ -1,7 +1,6 @@
 import pandas as pd
 import json
-from reg_hub_spoke.adf_resolver.resolver import get_all_uids_from_adfs
-from reg_hub_spoke.adf_resolver.resolver_optimized import get_uid_frames
+from reg_hub_spoke.adf_resolver.resolver import get_all_uids_from_adfs, get_uid_frames
 import datetime
 
 
