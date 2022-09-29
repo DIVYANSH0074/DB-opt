@@ -1,14 +1,14 @@
 import logging
 import re
 from copy import deepcopy
+
 from reg_hub_spoke.collection_constants import UniRegConstants
-from reg_hub_spoke.constants import RepoNameConstants
 from reg_hub_spoke.adf_resolver.utilities import get_repo_hierarchy, range_enumerator
 from reg_hub_spoke.db.operations import DB
 from reg_hub_spoke.db.queries import UniregQueries
 from reg_hub_spoke.logger.setup import get_logger
-from reg_ds.constants import AdfConstants
-from reg_ds.homoglyph import homoglyph_resolver
+# from reg_ds.homoglyph import homoglyph_resolver
+from reg_hub_spoke.constants import RepoNameConstants
 
 logger = get_logger()
 
@@ -31,10 +31,6 @@ class ADFResolver(object):
     @property
     def repo(self):
         return self.__repo
-
-    @repo.setter
-    def repo(self, repo):
-        self.__repo = repo
 
     def generate_adfs(self, adf):
         result_adf = []
@@ -70,7 +66,7 @@ class ADFResolver(object):
 
     def construct_regex(self, adf, repo_hierarchy):
         """ construct regex based adf """
-        if self.repo == RepoNameConstants.US_PLAW:
+        if self.repo == "US-PLAW":
             doc_number = adf.get('document_number')
             splitted_law_no = doc_number.split()
             law_no = splitted_law_no[-1]
@@ -127,9 +123,9 @@ class ADFResolver(object):
     def get_complete_uid(self, adf):
         """ returns complete uid from uid_regex """
         if not adf:
-            logger.error("Invalid adf: {0} to construct regex".format(adf))
+            logger.info("Invalid adf: {0} to construct regex".format(adf))
             return None
-        if self.repo == RepoNameConstants.US_FR:
+        if self.repo == 'US-FR':
             if 'citation' in adf:
                 ret_val, documents = DB.get_documents(UniRegConstants.COLLECTION,
                                                      query={UniRegConstants.CITATION: adf.get('citation'),
@@ -155,7 +151,7 @@ class ADFResolver(object):
                 return [doc.get(UniRegConstants.UID) for doc in documents]
             return None
 
-        if self.repo == RepoNameConstants.US_PLAW:
+        if self.repo == "US-PLAW":
             if 'alias' in adf:
                 adf['alias'] = adf['alias'].replace('–', '-')
                 ret_val, document = DB.get_documents(UniRegConstants.COLLECTION,
@@ -203,68 +199,64 @@ class ADFResolver(object):
         logger.warning("Unable to resolve uid regex: {0}. Has multiple matches".format(uid_regex))
         return None
 
-    def get_fr_uid_from_source(self, adf, source_uid):
-        """
-        param adf: fr adf object
-        param source_uid: uid of AuthDoc where FR citation occured
-        return: uid of FR document
-        Reference doc: https://regology.atlassian.net/wiki/spaces/TR/pages/178585611/Issues+with+FR+citations+source+field
-        Given an FR adf, check all the possible uids using page_number.
-        If there is only one uid, return that uid.
-        If there are multiple uids, then go into the each uid and check if the source_uid is present in the uid.
-        """
+    def get_dict_adf_uid(self, adf, repo_uid, unique_uid_regex):
         if not adf:
-            logger.error("Invalid adf: {0} to construct regex".format(adf))
+            logger.info("Invalid adf: {0} to construct regex".format(adf))
             return None
-        if not source_uid:
-            logger.error("Invalid source_uid passed: {0}".format(source_uid))
-            return None
-        if self.repo == RepoNameConstants.US_FR and AdfConstants.PAGE_NUMBER in adf:
-            repo = self.repo
-            volume = int(adf.get(AdfConstants.VOLUME, -1))
-            start_page = {"$lte": int(adf.get(AdfConstants.PAGE_NUMBER, 1))}
-            end_page = {"$gte": int(adf.get(AdfConstants.PAGE_NUMBER, 0))}
-            query = UniregQueries.repo_volume_start_page_end_page_query(
-                repo, volume, start_page, end_page
-            )
-            documents = UniregQueries.get_docs_by_query(
-                query,
-                projection={UniRegConstants.UID: 1, UniRegConstants.CFR_REFERENCES: 1},
-            )
-            if not documents:
-                logger.warning("Failed to resolve adf: {0}".format(adf))
-                return None
+        try:
+            uid_regex = self.get_uid_regex(adf)
 
-            uids = []
+        except Exception as e:
+            logger.warning("Got exception while fetching uid regex. Error: {0}".format(str(e)))
+            uid_regex = None
+
+        if uid_regex is None:
+            logger.warning("Uid regex is None for adf: {0}".format(self.adf))
+
+        copy_adf = adf.copy()
+        copy_adf['uid_regex'] = uid_regex
+
+        if adf.get('repo') not in repo_uid.keys():
+            repo_uid[adf.get('repo')] = []
+
+        repo_uid[adf.get('repo')].append(copy_adf)
+
+        if adf.get('repo') not in unique_uid_regex.keys():
+            unique_uid_regex[adf.get('repo')] = set()
+
+        unique_uid_regex[adf.get('repo')].add(uid_regex)
+
+        return repo_uid
+
+    def get_documents(self, repo_uid, unique_uid_regex):
+
+        for repo_field, regexes in unique_uid_regex.items():
+            uid_regex = '|'.join(regexes)
+            ret_val, documents = DB.get_documents(UniRegConstants.COLLECTION,
+                                                    query={UniRegConstants.UID: {'$regex': uid_regex},
+                                                           UniRegConstants.REPO: repo_field},
+                                                    projection={UniRegConstants.UID: 1})
+
+            uid_list = []
+
             for doc in documents:
-                # Forward link uids from the CFR references metadata.
-                fwd_uids = self.get_fr_to_cfr_uids(doc.get(UniRegConstants.CFR_REFERENCES, []))
-                uids.extend([doc.get(UniRegConstants.UID) for fwd_uid in fwd_uids if fwd_uid in source_uid])
-            return uids
-        return None
+                uid_list.append(doc.get(UniRegConstants.UID))
 
-    def get_fr_to_cfr_uids(self, cfr_references):
-        """
-        Given a list of CFR citations, returns their uids.
-        param cfr_references: cfr_references to get uids from.
-        return: list of uids.
-        """
-        uids = []
-        adfs = []
-        prev_repo = self.repo
-        if cfr_references is not None:
-            self.repo = RepoNameConstants.US_ECFR
-            for cfr_reference in cfr_references:
-                adf = {
-                    AdfConstants.TITLE: cfr_reference.get(AdfConstants.TITLE),
-                    AdfConstants.PART: cfr_reference.get(AdfConstants.PART),
-                    AdfConstants.REPO: RepoNameConstants.US_ECFR,
-                }
-                if adf.get(AdfConstants.TITLE) is not None and adf.get(AdfConstants.PART) is not None:
-                    adfs.append(adf)
-            uids = get_all_uids_from_adfs(adfs)
-        self.repo = prev_repo
-        return uids
+            for ind, adfs in enumerate(repo_uid[repo_field]):
+                # print(adfs)
+                regex_matches = []
+                uid_re = adfs['uid_regex']
+                for uid in uid_list:
+                    match = re.search(uid_re, uid)
+                    if match:
+                        regex_matches.append(uid)
+                if len(regex_matches) == 1:
+                    repo_uid[repo_field][ind]['UID'] = regex_matches
+                elif len(regex_matches) == 0:
+                    repo_uid[repo_field][ind]['UID'] = None
+                elif len(regex_matches) > 1:
+                    repo_uid[repo_field][ind]['UID'] = None
+                print(repo_uid[repo_field][ind])
 
 
 def get_all_uids_from_adfs(adfs):
@@ -316,11 +308,35 @@ def get_references_and_repos_from_adfs(adfs):
     return reference_repo_dict
 
 
-def get_uid_lists(copy_frames, unique_uid_regex):
-    for index, frame in enumerate(copy_frames):
+def get_all_uids_from_adfs_optimize(frames):
+    """ returns list of uids from frames"""
+    repo_uid = {}
+    unique_uid_regex = {}
+    print(frames)
+    for index, frame in enumerate(frames):
         adfs = frame.get('adfs')
         for adf in adfs:
             repo = adf.get('repo')
+            if repo:
+                adf_resolver = ADFResolver(repo, adf)
+                for _adf in adf_resolver.all_adfs:
+                    repo_uid = adf_resolver.get_dict_adf_uid(_adf, repo_uid, unique_uid_regex)
+
+    adf_resolver.get_documents(repo_uid, unique_uid_regex)
+
+
+def get_uid_lists(copy_frames, unique_uid_regex):
+    """
+    Functoin for set of unique uid regex from list of frmaes
+    :param list copy_frames: list of dict with cites and adfs field
+    :param dict unique_uid_regex: empty dict
+    :return copy_frames fileds as cites, adfs and uid_fields
+    :return unique_uid_regex: dict mapping repo with set of unique uid regex
+    """
+    for index, frame in enumerate(copy_frames):
+        adfs = frame.get("adfs")
+        for adf in adfs:
+            repo = adf.get("repo")
             if repo:
                 adf_resolver = ADFResolver(repo, adf)
                 for _adf in adf_resolver.all_adfs:
@@ -328,69 +344,92 @@ def get_uid_lists(copy_frames, unique_uid_regex):
                         logger.info("Invalid adf: {0} to construct regex".format(adf))
                         return copy_frames
 
-                    elif repo == 'US-FR':
+                    elif repo == "US-FR":
                         if "uid_fields" not in copy_frames[index]:
                             copy_frames[index]["uid_fields"] = []
                         dict_regex = dict()
-                        dict_regex['repo'] = repo
-                        dict_regex['UID'] = []
+                        dict_regex["repo"] = repo
+                        dict_regex["UID"] = []
 
-                        if 'citation' in _adf:
-                            ret_val, documents = DB.get_documents(UniRegConstants.COLLECTION,
-                                                                  query={UniRegConstants.CITATION: _adf.get('citation'),
-                                                                         UniRegConstants.REPO: repo},
-                                                                  projection={UniRegConstants.UID: 1})
-                            if ret_val is False:
+                        if "citation" in _adf:
+                            query = {
+                                UniRegConstants.CITATION: _adf.get("citation"),
+                                UniRegConstants.REPO: repo,
+                            }
+                            projection = {UniRegConstants.UID: 1}
+                            documents = UniregQueries.get_docs_by_query(
+                                query=query, projection=projection
+                            )
+                            if documents is None:
                                 logger.warning("Failed to resolve adf: {0}".format(adf))
-                                dict_regex['UID'] = []
+                                dict_regex["UID"] = []
                                 copy_frames[index]["uid_fields"].append(dict_regex)
 
                             if documents:
-                                dict_regex['UID'] = [doc.get(UniRegConstants.UID) for doc in documents]
+                                dict_regex["UID"] = [
+                                    doc.get(UniRegConstants.UID) for doc in documents
+                                ]
                                 copy_frames[index]["uid_fields"].append(dict_regex)
 
-                        ret_val, documents = DB.get_documents(UniRegConstants.COLLECTION,
-                                                              query={UniRegConstants.VOLUME: float(adf.get(UniRegConstants.VOLUME)),
-                                                                     UniRegConstants.START_PAGE: {
-                                                                        "$lte": float(adf.get('page_number', '1'))},
-                                                                     UniRegConstants.END_PAGE: {
-                                                                        "$gte": float(adf.get('page_number', '0'))},
-                                                                     UniRegConstants.REPO: repo},
-                                                                     projection={UniRegConstants.UID: 1})
-                        if ret_val is False:
+                        query = UniregQueries.repo_volume_start_page_end_page_query(
+                            repo=repo,
+                            volume=float(adf.get(UniRegConstants.VOLUME)),
+                            start_page={"$lte": float(adf.get("page_number", "1"))},
+                            end_page={"$gte": float(adf.get("page_number", "0"))},
+                        )
+                        projection = {UniRegConstants.UID: 1}
+                        documents = UniregQueries.get_docs_by_query(
+                            query=query, projection=projection
+                        )
+                        if documents is None:
                             logger.warning("Failed to resolve adf: {0}".format(adf))
-                            dict_regex['UID'] = []
+                            dict_regex["UID"] = []
 
                         if documents:
-                            dict_regex['UID'] = [doc.get(UniRegConstants.UID) for doc in documents]
+                            dict_regex["UID"] = [
+                                doc.get(UniRegConstants.UID) for doc in documents
+                            ]
                         copy_frames[index]["uid_fields"].append(dict_regex)
 
                     elif repo == "US-PLAW":
-                        if 'alias' in _adf:
-                            _adf['alias'] = _adf['alias'].replace('–', '-')
-                            ret_val, document = DB.get_documents(UniRegConstants.COLLECTION,
-                                                                 query={UniRegConstants.ALIAS: _adf.get('alias'),
-                                                                        UniRegConstants.REPO: repo},
-                                                                 projection={UniRegConstants.UID: 1}, find_one=True)
+                        if "alias" in _adf:
+                            _adf["alias"] = _adf["alias"].replace("–", "-")
+                            query = {
+                                UniRegConstants.ALIAS: _adf.get("alias"),
+                                UniRegConstants.REPO: repo,
+                            }
+                            projection = {UniRegConstants.UID: 1}
+                            document = UniregQueries.get_docs_by_query(
+                                query=query, projection=projection, find_one=True
+                            )
                         else:
-                            _adf['document_number'] = _adf['document_number'].replace('–', '-')
-                            ret_val, document = DB.get_documents(UniRegConstants.COLLECTION,
-                                                                 query={UniRegConstants.DOCUMENT_NUMBER: _adf.get('document_number'),
-                                                                        UniRegConstants.REPO: repo},
-                                                                 projection={UniRegConstants.UID: 1}, find_one=True)
+                            _adf["document_number"] = _adf["document_number"].replace(
+                                "–", "-"
+                            )
+                            query = {
+                                UniRegConstants.DOCUMENT_NUMBER: _adf.get(
+                                    "document_number"
+                                ),
+                                UniRegConstants.REPO: repo,
+                            }
+                            projection = {UniRegConstants.UID: 1}
+                            document = UniregQueries.get_docs_by_query(
+                                query=query, projection=projection, find_one=True
+                            )
 
                         if "uid_fields" not in copy_frames[index]:
                             copy_frames[index]["uid_fields"] = []
-                        dict_regex = dict()
-                        dict_regex['repo'] = repo
-                        dict_regex['UID'] = []
 
-                        if ret_val is False:
+                        dict_regex = dict()
+                        dict_regex["repo"] = repo
+                        dict_regex["UID"] = []
+
+                        if document is None:
                             logger.warning("Failed to resolve adf: {0}".format(adf))
-                            dict_regex['UID'] = []
+                            dict_regex["UID"] = []
 
                         if document:
-                            dict_regex['UID'] = [document.get(UniRegConstants.UID)]
+                            dict_regex["UID"] = [document.get(UniRegConstants.UID)]
                         copy_frames[index]["uid_fields"].append(dict_regex)
 
                     else:
@@ -398,11 +437,19 @@ def get_uid_lists(copy_frames, unique_uid_regex):
                             uid_regex = adf_resolver.get_uid_regex(_adf)
                             # uid_regex = homoglyph_resolver(uid_regex)
                             if uid_regex is None:
-                                logger.warning("Uid regex is None for adf: {0}".format(adf_resolver.adf))
+                                logger.warning(
+                                    "Uid regex is None for adf: {0}".format(
+                                        adf_resolver.adf
+                                    )
+                                )
 
                         except Exception as e:
                             uid_regex = None
-                            logger.warning("Got exception while fetching uid regex. Error: {0}".format(str(e)))
+                            logger.warning(
+                                "Got exception while fetching uid regex. Error: {0}".format(
+                                    str(e)
+                                )
+                            )
 
                         if repo not in unique_uid_regex.keys():
                             unique_uid_regex[repo] = set()
@@ -414,22 +461,68 @@ def get_uid_lists(copy_frames, unique_uid_regex):
 
                         dict_regex = dict()
                         if uid_regex:
-                            uid_regex = uid_regex[1:len(uid_regex)-1]
+                            uid_regex = uid_regex[1 : len(uid_regex) - 1]
 
-                        dict_regex['uid_regex'] = uid_regex
-                        dict_regex['repo'] = repo
+                        dict_regex["uid_regex"] = uid_regex
+                        dict_regex["repo"] = repo
                         copy_frames[index]["uid_fields"].append(dict_regex)
-    return copy_frames, unique_uid_regex  
+    return copy_frames, unique_uid_regex
 
 
-def get_uid_frames(frames):
-    """ returns list of uids from frames"""
+def get_uid_frames(frames, char_limit):
+    """
+    returns list of uids from frames
+    :param list frames: list of dict with cites and adfs field
+    frame = [
+            {
+                "cites": [
+                    {
+                        "begin": 0,
+                        "end": 21,
+                        "cite_text": "Article 20 Rules 9A, ",
+                        "span_begin": 0,
+                        "span_end": 21,
+                    }
+                ],
+                "index": 0,
+                "seg_id": "",
+                "adfs": [
+                    {"repo": "US-NYSE_CHICAGO", "article": "A20", "rule": "(R|RS|C)9A"}
+                ],
+            }
+        ]
+    :return copy_frame: list of dict with cites, adfs and uid_fields as a dict field
+    frame_adf = [
+            {
+                "cites": [
+                    {
+                        "begin": 0,
+                        "end": 21,
+                        "cite_text": "Article 20 Rules 9A, ",
+                        "span_begin": 0,
+                        "span_end": 21,
+                    }
+                ],
+                "index": 0,
+                "seg_id": "",
+                "adfs": [
+                    {"repo": "US-NYSE_CHICAGO", "article": "A20", "rule": "(R|RS|C)9A"}
+                ],
+                "uid_fields": [
+                    {
+                        "uid_regex": "US-NYSE_CHICAGO_T_A20_.*_(R|RS|C)9A",
+                        "repo": "US-NYSE_CHICAGO",
+                        "UID": ["US-NYSE_CHICAGO_T_A20_C_R9A"],
+                    }
+                ],
+            }
+        ]
+    """
     copy_frames = deepcopy(frames)
     unique_uid_regex = {}
     copy_frames, unique_uid_regex = get_uid_lists(copy_frames, unique_uid_regex)
 
     for repo_field, regexes in unique_uid_regex.items():
-        char_limit = 30000
         regexes = list(regexes)
         uids = set()
         while regexes:
@@ -444,11 +537,17 @@ def get_uid_frames(frames):
                 else:
                     break
 
-            uid_regex = '|'.join(uid_regex_list)
-            ret_val, documents = DB.get_documents(UniRegConstants.COLLECTION,
-                                                  query={UniRegConstants.UID: {'$regex': uid_regex},
-                                                         UniRegConstants.REPO: repo_field},
-                                                  projection={UniRegConstants.UID: 1})
+            concat_uid_regex = "|".join(uid_regex_list)
+
+            query = {
+                UniRegConstants.UID: {"$regex": concat_uid_regex},
+                UniRegConstants.REPO: repo_field,
+            }
+            projection = {UniRegConstants.UID: 1}
+            documents = UniregQueries.get_docs_by_query(
+                query=query, projection=projection
+            )
+
             for doc in documents:
                 if doc.get(UniRegConstants.UID) == repo_field:
                     continue
@@ -456,14 +555,14 @@ def get_uid_frames(frames):
                     uids.add(doc.get(UniRegConstants.UID))
 
         for index, frame in enumerate(copy_frames):
-            if 'uid_fields' in frame.keys():
-                uid_fields = frame['uid_fields']
+            if "uid_fields" in frame.keys():
+                uid_fields = frame["uid_fields"]
                 for num, uid_field in enumerate(uid_fields):
-                    if uid_field['repo'] == repo_field:
+                    if uid_field["repo"] == repo_field:
                         regex_matches = []
-                        uid_re = "(," + uid_field['uid_regex'] + ",)"
+                        uid_re = "(," + uid_field["uid_regex"] + ",)"
 
-                        if uid_field['repo'] == "US-ECFR":
+                        if uid_field["repo"] == "US-ECFR":
                             uid_re = uid_re.replace(".*", "?.[^\,]*")
                         else:
                             uid_re = uid_re.replace(".*", ".[^\,]*")
@@ -478,15 +577,23 @@ def get_uid_frames(frames):
                             else:
                                 match = regex_matches[0]
 
-                            match = [match[1:len(match)-1]]
+                            match = [match[1 : len(match) - 1]]
 
                         elif len(regex_matches) == 0:
-                            logger.warning("Unable to resolve uid regex, ends with zero matches: {0}".format(uid_re))
+                            logger.warning(
+                                "Unable to resolve uid regex, ends with zero matches: {0}".format(
+                                    uid_re
+                                )
+                            )
                             match = []
 
                         else:
-                            logger.warning("Unable to resolve uid regex: {0}. Has multiple matches".format(uid_re))
+                            logger.warning(
+                                "Unable to resolve uid regex: {0}. Has multiple matches".format(
+                                    uid_re
+                                )
+                            )
                             match = []
 
-                        copy_frames[index]['uid_fields'][num]['UID'] = match
+                        copy_frames[index]["uid_fields"][num]["UID"] = match
     return copy_frames
