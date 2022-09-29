@@ -557,7 +557,7 @@ def get_uid_frames(frames, char_limit):
                         else:
                             uid_re = uid_re.replace(".*", ".[^\,]*")
 
-                        uid_string = ",".join(uids)
+                        uid_string = ",,".join(uids)
                         uid_string = "," + uid_string + ","
                         regex_matches = re.findall(uid_re, uid_string)
                         if len(regex_matches) == 1:
