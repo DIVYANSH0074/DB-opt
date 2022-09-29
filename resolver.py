@@ -1,12 +1,13 @@
 import logging
 import re
 from copy import deepcopy
-
 from reg_hub_spoke.collection_constants import UniRegConstants
+from reg_hub_spoke.constants import RepoNameConstants
 from reg_hub_spoke.adf_resolver.utilities import get_repo_hierarchy, range_enumerator
 from reg_hub_spoke.db.operations import DB
 from reg_hub_spoke.db.queries import UniregQueries
 from reg_hub_spoke.logger.setup import get_logger
+from reg_ds.constants import AdfConstants
 from reg_ds.homoglyph import homoglyph_resolver
 
 logger = get_logger()
@@ -30,6 +31,10 @@ class ADFResolver(object):
     @property
     def repo(self):
         return self.__repo
+
+    @repo.setter
+    def repo(self, repo):
+        self.__repo = repo
 
     def generate_adfs(self, adf):
         result_adf = []
@@ -65,7 +70,7 @@ class ADFResolver(object):
 
     def construct_regex(self, adf, repo_hierarchy):
         """ construct regex based adf """
-        if self.repo == "US-PLAW":
+        if self.repo == RepoNameConstants.US_PLAW:
             doc_number = adf.get('document_number')
             splitted_law_no = doc_number.split()
             law_no = splitted_law_no[-1]
@@ -122,9 +127,9 @@ class ADFResolver(object):
     def get_complete_uid(self, adf):
         """ returns complete uid from uid_regex """
         if not adf:
-            logger.info("Invalid adf: {0} to construct regex".format(adf))
+            logger.error("Invalid adf: {0} to construct regex".format(adf))
             return None
-        if self.repo == 'US-FR':
+        if self.repo == RepoNameConstants.US_FR:
             if 'citation' in adf:
                 ret_val, documents = DB.get_documents(UniRegConstants.COLLECTION,
                                                      query={UniRegConstants.CITATION: adf.get('citation'),
@@ -150,7 +155,7 @@ class ADFResolver(object):
                 return [doc.get(UniRegConstants.UID) for doc in documents]
             return None
 
-        if self.repo == "US-PLAW":
+        if self.repo == RepoNameConstants.US_PLAW:
             if 'alias' in adf:
                 adf['alias'] = adf['alias'].replace('–', '-')
                 ret_val, document = DB.get_documents(UniRegConstants.COLLECTION,
@@ -198,64 +203,68 @@ class ADFResolver(object):
         logger.warning("Unable to resolve uid regex: {0}. Has multiple matches".format(uid_regex))
         return None
 
-    def get_dict_adf_uid(self, adf, repo_uid, unique_uid_regex):
+    def get_fr_uid_from_source(self, adf, source_uid):
+        """
+        param adf: fr adf object
+        param source_uid: uid of AuthDoc where FR citation occured
+        return: uid of FR document
+        Reference doc: https://regology.atlassian.net/wiki/spaces/TR/pages/178585611/Issues+with+FR+citations+source+field
+        Given an FR adf, check all the possible uids using page_number.
+        If there is only one uid, return that uid.
+        If there are multiple uids, then go into the each uid and check if the source_uid is present in the uid.
+        """
         if not adf:
-            logger.info("Invalid adf: {0} to construct regex".format(adf))
+            logger.error("Invalid adf: {0} to construct regex".format(adf))
             return None
-        try:
-            uid_regex = self.get_uid_regex(adf)
+        if not source_uid:
+            logger.error("Invalid source_uid passed: {0}".format(source_uid))
+            return None
+        if self.repo == RepoNameConstants.US_FR and AdfConstants.PAGE_NUMBER in adf:
+            repo = self.repo
+            volume = int(adf.get(AdfConstants.VOLUME, -1))
+            start_page = {"$lte": int(adf.get(AdfConstants.PAGE_NUMBER, 1))}
+            end_page = {"$gte": int(adf.get(AdfConstants.PAGE_NUMBER, 0))}
+            query = UniregQueries.repo_volume_start_page_end_page_query(
+                repo, volume, start_page, end_page
+            )
+            documents = UniregQueries.get_docs_by_query(
+                query,
+                projection={UniRegConstants.UID: 1, UniRegConstants.CFR_REFERENCES: 1},
+            )
+            if not documents:
+                logger.warning("Failed to resolve adf: {0}".format(adf))
+                return None
 
-        except Exception as e:
-            logger.warning("Got exception while fetching uid regex. Error: {0}".format(str(e)))
-            uid_regex = None
-
-        if uid_regex is None:
-            logger.warning("Uid regex is None for adf: {0}".format(self.adf))
-
-        copy_adf = adf.copy()
-        copy_adf['uid_regex'] = uid_regex
-
-        if adf.get('repo') not in repo_uid.keys():
-            repo_uid[adf.get('repo')] = []
-
-        repo_uid[adf.get('repo')].append(copy_adf)
-
-        if adf.get('repo') not in unique_uid_regex.keys():
-            unique_uid_regex[adf.get('repo')] = set()
-
-        unique_uid_regex[adf.get('repo')].add(uid_regex)
-
-        return repo_uid
-
-    def get_documents(self, repo_uid, unique_uid_regex):
-
-        for repo_field, regexes in unique_uid_regex.items():
-            uid_regex = '|'.join(regexes)
-            ret_val, documents = DB.get_documents(UniRegConstants.COLLECTION,
-                                                    query={UniRegConstants.UID: {'$regex': uid_regex},
-                                                           UniRegConstants.REPO: repo_field},
-                                                    projection={UniRegConstants.UID: 1})
-
-            uid_list = []
-
+            uids = []
             for doc in documents:
-                uid_list.append(doc.get(UniRegConstants.UID))
+                # Forward link uids from the CFR references metadata.
+                fwd_uids = self.get_fr_to_cfr_uids(doc.get(UniRegConstants.CFR_REFERENCES, []))
+                uids.extend([doc.get(UniRegConstants.UID) for fwd_uid in fwd_uids if fwd_uid in source_uid])
+            return uids
+        return None
 
-            for ind, adfs in enumerate(repo_uid[repo_field]):
-                # print(adfs)
-                regex_matches = []
-                uid_re = adfs['uid_regex']
-                for uid in uid_list:
-                    match = re.search(uid_re, uid)
-                    if match:
-                        regex_matches.append(uid)
-                if len(regex_matches) == 1:
-                    repo_uid[repo_field][ind]['UID'] = regex_matches
-                elif len(regex_matches) == 0:
-                    repo_uid[repo_field][ind]['UID'] = None
-                elif len(regex_matches) > 1:
-                    repo_uid[repo_field][ind]['UID'] = None
-                print(repo_uid[repo_field][ind])
+    def get_fr_to_cfr_uids(self, cfr_references):
+        """
+        Given a list of CFR citations, returns their uids.
+        param cfr_references: cfr_references to get uids from.
+        return: list of uids.
+        """
+        uids = []
+        adfs = []
+        prev_repo = self.repo
+        if cfr_references is not None:
+            self.repo = RepoNameConstants.US_ECFR
+            for cfr_reference in cfr_references:
+                adf = {
+                    AdfConstants.TITLE: cfr_reference.get(AdfConstants.TITLE),
+                    AdfConstants.PART: cfr_reference.get(AdfConstants.PART),
+                    AdfConstants.REPO: RepoNameConstants.US_ECFR,
+                }
+                if adf.get(AdfConstants.TITLE) is not None and adf.get(AdfConstants.PART) is not None:
+                    adfs.append(adf)
+            uids = get_all_uids_from_adfs(adfs)
+        self.repo = prev_repo
+        return uids
 
 
 def get_all_uids_from_adfs(adfs):
@@ -305,24 +314,6 @@ def get_references_and_repos_from_adfs(adfs):
     for key, value in reference_repo_dict.items():
         reference_repo_dict[key] = list(dict.fromkeys(value))
     return reference_repo_dict
-
-
-def get_all_uids_from_adfs_optimize(frames):
-    """ returns list of uids from frames"""
-    repo_uid = {}
-    unique_uid_regex = {}
-    print(frames)
-    for index, frame in enumerate(frames):
-        adfs = frame.get('adfs')
-        for adf in adfs:
-            repo = adf.get('repo')
-            if repo:
-                adf_resolver = ADFResolver(repo, adf)
-                for _adf in adf_resolver.all_adfs:
-                    repo_uid = adf_resolver.get_dict_adf_uid(_adf, repo_uid, unique_uid_regex)
-
-    adf_resolver.get_documents(repo_uid, unique_uid_regex)
-
 
 def get_uid_lists(copy_frames, unique_uid_regex):
     """
