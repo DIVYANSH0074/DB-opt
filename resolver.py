@@ -7,8 +7,7 @@ from reg_hub_spoke.adf_resolver.utilities import get_repo_hierarchy, range_enume
 from reg_hub_spoke.db.operations import DB
 from reg_hub_spoke.db.queries import UniregQueries
 from reg_hub_spoke.logger.setup import get_logger
-# from reg_ds.homoglyph import homoglyph_resolver
-from reg_hub_spoke.constants import RepoNameConstants
+from reg_ds.homoglyph import homoglyph_resolver
 
 logger = get_logger()
 
